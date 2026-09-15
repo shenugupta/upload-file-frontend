@@ -1,7 +1,16 @@
 import { File, UploadType } from 'expo-file-system';
 import * as ImagePicker from 'expo-image-picker';
-import { useState } from 'react';
-import { ActivityIndicator, Alert, Button, StyleSheet, Text, View } from 'react-native';
+import { openBrowserAsync, WebBrowserPresentationStyle } from 'expo-web-browser';
+import { useCallback, useEffect, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  Button,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3001';
 
@@ -11,6 +20,24 @@ type SelectedVideo = {
   contentType: string;
   fileSize?: number;
   duration?: number;
+};
+
+type VideoListItem = {
+  key: string;
+  size?: number;
+  lastModified?: string;
+  openUrl: string;
+  getVideoUrl?: string;
+};
+
+type VideoDetails = {
+  url: string;
+  openUrl: string;
+  key: string;
+  bucket: string;
+  contentType?: string;
+  contentLength?: number;
+  expires?: number;
 };
 
 function getVideoFileName(asset: ImagePicker.ImagePickerAsset) {
@@ -25,6 +52,10 @@ function getVideoFileName(asset: ImagePicker.ImagePickerAsset) {
 
   const extension = asset.mimeType === 'video/quicktime' ? 'mov' : 'mp4';
   return `video-${Date.now()}.${extension}`;
+}
+
+function fileNameFromKey(key: string) {
+  return decodeURIComponent(key.split('/').pop() ?? key);
 }
 
 function formatBytes(bytes?: number) {
@@ -45,9 +76,36 @@ function formatBytes(bytes?: number) {
 
 export default function HomeScreen() {
   const [loading, setLoading] = useState(false);
+  const [openingKey, setOpeningKey] = useState<string | null>(null);
   const [progress, setProgress] = useState<number | null>(null);
   const [message, setMessage] = useState('');
   const [selectedVideo, setSelectedVideo] = useState<SelectedVideo | null>(null);
+  const [videos, setVideos] = useState<VideoListItem[]>([]);
+  const [videosLoading, setVideosLoading] = useState(false);
+
+  const loadVideos = useCallback(async () => {
+    try {
+      setVideosLoading(true);
+      const response = await fetch(`${API_URL}/videos`);
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || 'Failed to load videos');
+      }
+
+      setVideos(Array.isArray(result.data) ? result.data : []);
+    } catch (error) {
+      console.error(error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      setMessage(`Failed to load videos: ${errorMessage}`);
+    } finally {
+      setVideosLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadVideos();
+  }, [loadVideos]);
 
   const pickVideo = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -129,6 +187,7 @@ export default function HomeScreen() {
 
       setProgress(100);
       setMessage('Upload Successful!');
+      await loadVideos();
       Alert.alert('Success', `${selectedVideo.fileName} uploaded successfully`);
     } catch (error) {
       console.error(error);
@@ -139,8 +198,39 @@ export default function HomeScreen() {
     }
   };
 
+  const openVideo = async (item: VideoListItem) => {
+    try {
+      setOpeningKey(item.key);
+      setMessage('');
+
+      const response = await fetch(`${API_URL}/get-video?key=${encodeURIComponent(item.key)}`);
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || `Request failed (${response.status})`);
+      }
+
+      const details = result.data as VideoDetails;
+      const urlToOpen = details.openUrl || details.url;
+
+      if (!urlToOpen) {
+        throw new Error('No open URL returned for this video');
+      }
+
+      await openBrowserAsync(urlToOpen, {
+        presentationStyle: WebBrowserPresentationStyle.AUTOMATIC,
+      });
+    } catch (error) {
+      console.error(error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      setMessage(`Failed to open video: ${errorMessage}`);
+    } finally {
+      setOpeningKey(null);
+    }
+  };
+
   return (
-    <View style={styles.container}>
+    <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.title}>S3 Video Upload</Text>
 
       <Button title="Pick Video" onPress={pickVideo} disabled={loading} />
@@ -168,16 +258,43 @@ export default function HomeScreen() {
       {progress !== null && <Text style={styles.progress}>{progress}%</Text>}
 
       {message !== '' && <Text style={styles.message}>{message}</Text>}
-    </View>
+
+      <View style={styles.listHeader}>
+        <Text style={styles.listTitle}>Uploaded videos</Text>
+        <Button title={videosLoading ? 'Loading...' : 'Refresh'} onPress={loadVideos} disabled={videosLoading} />
+      </View>
+
+      {videosLoading && videos.length === 0 && <ActivityIndicator style={styles.loader} />}
+
+      {videos.length === 0 && !videosLoading && (
+        <Text style={styles.meta}>No videos yet. Upload one to see it here.</Text>
+      )}
+
+      {videos.map((item) => (
+        <View key={item.key} style={styles.videoCard}>
+          <Text style={styles.fileName}>{fileNameFromKey(item.key)}</Text>
+          <Text style={styles.meta}>{formatBytes(item.size)}</Text>
+          <View style={styles.openButton}>
+            <Button
+              title={openingKey === item.key ? 'Opening...' : 'Open URL'}
+              onPress={() => void openVideo(item)}
+              disabled={openingKey !== null}
+            />
+          </View>
+        </View>
+      ))}
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
-    flex: 1,
-    justifyContent: 'center',
+    flexGrow: 1,
+    justifyContent: 'flex-start',
     alignItems: 'center',
     padding: 20,
+    paddingTop: 60,
+    paddingBottom: 40,
   },
   title: {
     fontSize: 24,
@@ -198,6 +315,7 @@ const styles = StyleSheet.create({
     marginTop: 6,
     fontSize: 14,
     color: '#666',
+    textAlign: 'center',
   },
   uploadButton: {
     marginTop: 20,
@@ -213,5 +331,27 @@ const styles = StyleSheet.create({
     marginTop: 20,
     fontSize: 18,
     textAlign: 'center',
+  },
+  listHeader: {
+    width: '100%',
+    marginTop: 36,
+    marginBottom: 12,
+    alignItems: 'center',
+    gap: 8,
+  },
+  listTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+  },
+  videoCard: {
+    width: '100%',
+    marginTop: 12,
+    padding: 16,
+    borderRadius: 12,
+    backgroundColor: '#f4f4f5',
+    alignItems: 'center',
+  },
+  openButton: {
+    marginTop: 12,
   },
 });

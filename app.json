@@ -36,7 +36,9 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "Allow S3UploadApp to access videos so you can upload them to S3."
+          "photosPermission": "Allow S3UploadApp to access photos and videos so you can upload them.",
+          "cameraPermission": "Allow S3UploadApp to take a selfie or video for upload and verification.",
+          "microphonePermission": "Allow S3UploadApp to record video with audio."
         }
       ]
     ],

@@ -119,39 +119,81 @@ function formatBytes(bytes?: number) {
   return `${size.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
-async function ensureUser(email: string): Promise<UserAccount> {
+async function readJson(response: Response) {
+  const text = await response.text();
+  const trimmed = text.trim();
+
+  if (!trimmed) {
+    throw new Error(`Empty response from server (${response.status})`);
+  }
+
+  if (trimmed.startsWith('<')) {
+    throw new Error(
+      `Server returned HTML instead of JSON (${response.status}). ${response.url} is not a JSON API.`
+    );
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    throw new Error(`Invalid JSON from server (${response.status}): ${trimmed.slice(0, 120)}`);
+  }
+}
+
+function isMissingApiRoute(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('HTML instead of JSON') || message.includes('Cannot POST');
+}
+
+async function ensureUser(email: string): Promise<UserAccount | null> {
   const trimmedEmail = email.trim().toLowerCase();
 
   if (!trimmedEmail) {
-    throw new Error('Email is required');
+    return null;
   }
 
-  const signInResponse = await fetch(`${API_URL}/signin`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: trimmedEmail }),
-  });
-  const signInResult = await signInResponse.json();
+  try {
+    const signInResponse = await fetch(`${API_URL}/signin`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: trimmedEmail }),
+    });
+    const signInResult = await readJson(signInResponse);
 
-  if (signInResponse.ok && signInResult.success) {
-    return signInResult.data as UserAccount;
+    if (signInResponse.ok && signInResult.success) {
+      return signInResult.data as UserAccount;
+    }
+  } catch (error) {
+    if (isMissingApiRoute(error)) {
+      return null;
+    }
   }
 
-  const signUpResponse = await fetch(`${API_URL}/signup`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      name: trimmedEmail.split('@')[0] || 'App User',
-      email: trimmedEmail,
-    }),
-  });
-  const signUpResult = await signUpResponse.json();
+  try {
+    const signUpResponse = await fetch(`${API_URL}/signup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: trimmedEmail.split('@')[0] || 'App User',
+        email: trimmedEmail,
+      }),
+    });
+    const signUpResult = await readJson(signUpResponse);
 
-  if (!signUpResponse.ok || !signUpResult.success) {
-    throw new Error(signUpResult.message || 'Could not sign in or sign up');
+    if (!signUpResponse.ok || !signUpResult.success) {
+      if (signUpResponse.status === 404) {
+        return null;
+      }
+      throw new Error(signUpResult.message || 'Could not sign in or sign up');
+    }
+
+    return signUpResult.data as UserAccount;
+  } catch (error) {
+    if (isMissingApiRoute(error)) {
+      return null;
+    }
+    throw error;
   }
-
-  return signUpResult.data as UserAccount;
 }
 
 async function requestCamera() {
@@ -250,7 +292,7 @@ async function uploadFile({
   onProgress,
 }: {
   media: SelectedImage | SelectedVideo;
-  user: UserAccount;
+  user: UserAccount | null;
   doctype: string;
   onProgress?: (percent: number) => void;
 }) {
@@ -260,12 +302,11 @@ async function uploadFile({
     body: JSON.stringify({
       fileName: media.fileName,
       contentType: media.contentType,
-      userId: user.id,
-      email: user.email,
+      ...(user ? { userId: user.id, email: user.email } : {}),
       doctype,
     }),
   });
-  const result = await response.json();
+  const result = await readJson(response);
 
   if (!response.ok || !result.success) {
     throw new Error(result.message || `Failed to get upload URL for ${doctype}`);
@@ -306,7 +347,7 @@ export default function HomeScreen() {
     try {
       setVideosLoading(true);
       const response = await fetch(`${API_URL}/videos`);
-      const result = await response.json();
+      const result = await readJson(response);
 
       if (!response.ok || !result.success) {
         throw new Error(result.message || 'Failed to load videos');
@@ -430,34 +471,52 @@ export default function HomeScreen() {
 
       setProgress(95);
 
-      const verifyResponse = await fetch(`${API_URL}/verify`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: user.id,
-          email: user.email,
-          doctype: idType,
-        }),
-      });
-      const verifyResult = await verifyResponse.json();
+      let verifyResult: { success?: boolean; data?: { verified?: boolean; reason?: string }; message?: string } | null =
+        null;
 
-      if (!verifyResponse.ok) {
-        throw new Error(verifyResult.message || 'Verification request failed');
+      try {
+        const verifyResponse = await fetch(`${API_URL}/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...(user ? { userId: user.id, email: user.email } : {}),
+            doctype: idType,
+          }),
+        });
+        verifyResult = await readJson(verifyResponse);
+
+        if (!verifyResponse.ok && verifyResponse.status !== 404) {
+          throw new Error(verifyResult?.message || 'Verification request failed');
+        }
+
+        if (verifyResponse.status === 404) {
+          verifyResult = null;
+        }
+      } catch (error) {
+        if (!isMissingApiRoute(error)) {
+          throw error;
+        }
+        verifyResult = null;
       }
 
       setProgress(100);
 
-      const verified = Boolean(verifyResult.data?.verified);
-      const reason =
-        verifyResult.data?.reason ||
-        (verified ? 'Selfie matched the uploaded ID document.' : 'Verification did not succeed.');
-
-      if (verified) {
-        setStatus({ type: 'success', text: `Verified successfully. ${reason}` });
-        Alert.alert('Verified', reason);
+      if (!verifyResult) {
+        setStatus({ type: 'success', text: 'Upload successful.' });
+        Alert.alert('Success', 'Files uploaded successfully.');
       } else {
-        setStatus({ type: 'error', text: `Verification failed. ${reason}` });
-        Alert.alert('Verification failed', reason);
+        const verified = Boolean(verifyResult.data?.verified);
+        const reason =
+          verifyResult.data?.reason ||
+          (verified ? 'Selfie matched the uploaded ID document.' : 'Verification did not succeed.');
+
+        if (verified) {
+          setStatus({ type: 'success', text: `Verified successfully. ${reason}` });
+          Alert.alert('Verified', reason);
+        } else {
+          setStatus({ type: 'error', text: `Verification failed. ${reason}` });
+          Alert.alert('Verification failed', reason);
+        }
       }
 
       await loadVideos();
@@ -476,7 +535,7 @@ export default function HomeScreen() {
       setOpeningKey(item.key);
 
       const response = await fetch(`${API_URL}/get-video?key=${encodeURIComponent(item.key)}`);
-      const result = await response.json();
+      const result = await readJson(response);
 
       if (!response.ok || !result.success) {
         throw new Error(result.message || `Request failed (${response.status})`);
